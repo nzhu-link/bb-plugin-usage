@@ -124,9 +124,17 @@ function lines(content: string) {
 function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
   const override = lookupPriceOverride(activePriceOverrides(), input.modelProviderId, input.model);
   const resolved = resolvePricing(input.modelProviderId, input.model);
+  // An override says the catalog's attribution for this row is wrong, so the row
+  // keeps the provider id it arrived with. That keeps the display honest — a
+  // self-hosted model is not the public vendor whose name it borrowed — and it
+  // keeps the override key findable when the next sync reprices the stored row,
+  // which carries the resolved provider id and nothing else.
+  const ownProviderId = normalizeProviderId(input.modelProviderId);
   const pricing: PricingResult = override
     ? {
         ...resolved,
+        modelProviderId: ownProviderId,
+        modelProviderName: resolved.modelProviderId === ownProviderId ? resolved.modelProviderName : ownProviderId,
         price: override.price
           ? {
               input: override.price.input,

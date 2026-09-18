@@ -485,6 +485,29 @@ describe("operator price overrides", () => {
     expect(repriceUsageRecord(stored)).toMatchObject({ costUsd: 1.8, pricingStatus: "models-dev-exact" });
   });
 
+  // The stored row keeps only the resolved provider id, so an override keyed on
+  // the row's own provider has to survive being read back and repriced.
+  it("keeps the row's own provider so a provider-keyed override survives repricing", () => {
+    setPricingCatalog({ zai: { name: "Z.ai", models: {
+      "glm-5.3": { id: "glm-5.3", cost: { input: 1.4, output: 4.4 } },
+    } } }, "test");
+    const borrowedName = JSON.stringify([{
+      day: "2026-08-09", modelProviderId: "sglm53", model: "glm-5.3", loggedCostUsd: 0,
+      inputTokens: 1000000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1000000, reasoningTokens: 0,
+    }]);
+    expect(parseOpenCode(borrowedName, machine)[0]).toMatchObject({
+      modelProviderId: "zai", costUsd: 5.8, pricingStatus: "models-dev-alias",
+    });
+
+    activate({ "sglm53/glm-5.3": null });
+    const overridden = parseOpenCode(borrowedName, machine)[0]!;
+    expect(overridden).toMatchObject({
+      modelProviderId: "sglm53", modelProviderName: "sglm53", costUsd: 0, pricingStatus: "unknown",
+    });
+    expect(repriceUsageRecord(overridden)).toMatchObject({ modelProviderId: "sglm53", costUsd: 0, pricingStatus: "unknown" });
+    expect(repriceUsageRecord(repriceUsageRecord(overridden))).toMatchObject({ costUsd: 0, pricingStatus: "unknown" });
+  });
+
   it("leaves a model without an override untouched", () => {
     catalog();
     activate({ "*/us.openai.gpt-6-astra": { input: 11, output: 55 } });
