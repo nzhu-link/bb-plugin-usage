@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { parseClaude, parseCodex, parseGrok, parseHostUsageAggregates, parseOpenCode, parsePi, parsePrime } from "./collectors";
+import { parseClaude, parseCodex, parseGrok, parseHostUsageAggregates, parseOpenCode, parsePi, parsePrime, repriceUsageRecord } from "./collectors";
 
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
+import { parsePriceOverrides, resetActivePriceOverrides, setActivePriceOverrides } from "./lib/price-overrides";
 
 afterEach(() => resetPricingCatalog());
 
@@ -423,5 +424,72 @@ describe("agent cost fallback", () => {
       expect(parseHostUsageAggregates(JSON.stringify([row]), agent, machine)[0]).toMatchObject({ costUsd: 73.5, pricingStatus: "models-dev-exact" });
       expect(parseHostUsageAggregates(JSON.stringify([{ ...row, loggedCostUsd: 7 }]), agent, machine)[0]).toMatchObject({ costUsd: 7, pricingStatus: "logged" });
     }
+  });
+});
+
+describe("operator price overrides", () => {
+  afterEach(() => resetActivePriceOverrides());
+
+  // A private model served under a public model's name is priced by the public
+  // rates unless an override says otherwise, so these cases pin both the
+  // replacement rates and the force-unknown entry.
+  const catalog = () => setPricingCatalog({ opencode: { name: "OpenCode Zen", models: {
+    "glm-5.3": { id: "glm-5.3", cost: { input: 0.3, output: 1.5 } },
+  } } }, "test");
+
+  const activate = (overrides: Record<string, unknown>) => {
+    const { overrides: parsed, problems } = parsePriceOverrides(JSON.stringify(overrides));
+    expect(problems).toEqual([]);
+    setActivePriceOverrides(parsed);
+  };
+
+  const row = (model: string, loggedCostUsd: number, extra: Record<string, number> = {}) => JSON.stringify([{
+    day: "2026-08-09", modelProviderId: "opencode", model, loggedCostUsd,
+    inputTokens: 1000000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1000000, reasoningTokens: 0, ...extra,
+  }]);
+
+  it("prices an overridden model from the override rates, not the agent's logged cost", () => {
+    activate({ "*/us.openai.gpt-6-astra": { input: 11, output: 55 } });
+    expect(parseOpenCode(row("us.openai.gpt-6-astra", 3.5), machine)[0]).toMatchObject({
+      costUsd: 66, loggedCostUsd: null, pricingStatus: "override",
+    });
+  });
+
+  it("applies the override cache rate to the cost and the cache savings", () => {
+    activate({ "opencode/us.openai.gpt-6-astra": { input: 11, output: 55, cached: 1.1 } });
+    expect(parseOpenCode(row("us.openai.gpt-6-astra", 0, { cachedInputTokens: 1000000 }), machine)[0]).toMatchObject({
+      costUsd: 67.1, cacheSavingsUsd: 9.9, pricingStatus: "override",
+    });
+  });
+
+  it("forces unknown for a private model that collides with a public name", () => {
+    catalog();
+    expect(parseOpenCode(row("glm-5.3", 0), machine)[0]).toMatchObject({ costUsd: 1.8, pricingStatus: "models-dev-exact" });
+    activate({ "opencode/glm-5.3": null });
+    for (const logged of [0, 30.53]) {
+      expect(parseOpenCode(row("glm-5.3", logged), machine)[0]).toMatchObject({
+        costUsd: 0, loggedCostUsd: null, pricingStatus: "unknown",
+      });
+    }
+  });
+
+  it("reprices a retained row when the overrides change", () => {
+    catalog();
+    const stored = parseOpenCode(row("glm-5.3", 0), machine)[0]!;
+    expect(stored.pricingStatus).toBe("models-dev-exact");
+    activate({ "opencode/glm-5.3": null });
+    expect(repriceUsageRecord(stored)).toMatchObject({ eventKey: stored.eventKey, costUsd: 0, pricingStatus: "unknown" });
+    activate({ "opencode/glm-5.3": { input: 0.6, output: 2.2 } });
+    expect(repriceUsageRecord(stored)).toMatchObject({ eventKey: stored.eventKey, costUsd: 2.8, pricingStatus: "override" });
+    resetActivePriceOverrides();
+    expect(repriceUsageRecord(stored)).toMatchObject({ costUsd: 1.8, pricingStatus: "models-dev-exact" });
+  });
+
+  it("leaves a model without an override untouched", () => {
+    catalog();
+    activate({ "*/us.openai.gpt-6-astra": { input: 11, output: 55 } });
+    expect(parseOpenCode(row("glm-5.3", 0.9), machine)[0]).toMatchObject({
+      costUsd: 0.9, loggedCostUsd: 0.9, pricingStatus: "logged",
+    });
   });
 });

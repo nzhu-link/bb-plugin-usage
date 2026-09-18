@@ -16,6 +16,7 @@ import {
 } from "./lib/host-json-collector";
 import { compressedDevinCollectorScript } from "./lib/devin-sqlite-collector";
 import { pricingRevision, pricingVersion } from "./lib/pricing";
+import { parsePriceOverrides, setActivePriceOverrides } from "./lib/price-overrides";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
@@ -946,6 +947,7 @@ export function dashboardRecordsSql() {
     CASE
       WHEN SUM(CASE WHEN pricing_status='unknown' THEN 1 ELSE 0 END)>0 THEN 'unknown'
       WHEN SUM(CASE WHEN pricing_status='logged' THEN 1 ELSE 0 END)>0 THEN 'logged'
+      WHEN SUM(CASE WHEN pricing_status='override' THEN 1 ELSE 0 END)>0 THEN 'override'
       WHEN SUM(CASE WHEN pricing_status='models-dev-alias' THEN 1 ELSE 0 END)>0 THEN 'models-dev-alias'
       ELSE 'models-dev-exact'
     END pricingStatus,
@@ -984,6 +986,12 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Optional semicolon-separated absolute session directories. The default ~/.prime/agent/sessions and its recursive-agent artifacts are always scanned.",
       default: "",
     },
+    priceOverrides: {
+      type: "string",
+      label: "Price overrides",
+      description: 'Optional JSON object mapping "provider/model" (or "*/model") to per-1M rates {"input":11,"output":55} or null to force unknown. Overrides beat catalog and logged prices and reprice retained rows on the next sync.',
+      default: "",
+    },
   });
   const db = bb.storage.database();
   bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration]);
@@ -1002,6 +1010,9 @@ export default async function plugin(bb: BbPluginApi) {
       const machines = await bb.sdk.hosts.list({ signal: timeoutSignal(SYNC_HOSTS_TIMEOUT_MS, serviceSignal) });
       reconcileMachines(db, machines.map((machine) => machine.id));
       const collectorSettings = await settings.get();
+      const { overrides, problems } = parsePriceOverrides(collectorSettings.priceOverrides);
+      for (const problem of problems) bb.log.error(`Usage priceOverrides: ${problem}`);
+      setActivePriceOverrides(overrides);
       for (const machine of machines) {
         if (serviceSignal?.aborted) throw serviceSignal.reason;
         if (machine.status !== "connected") {

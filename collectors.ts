@@ -1,4 +1,5 @@
-import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
+import { normalizeProviderId, resolvePricing, type PricingResult, type PricingStatus } from "./lib/pricing";
+import { activePriceOverrides, lookupPriceOverride } from "./lib/price-overrides";
 
 // `codex-<name>` ids are emitted for extra Codex accounts whose CODEX_HOME
 // lives under ~/.codex-profiles/<name>, so each account stays a distinct agent
@@ -121,21 +122,44 @@ function lines(content: string) {
 }
 
 function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
-  const pricing = resolvePricing(input.modelProviderId, input.model);
+  const override = lookupPriceOverride(activePriceOverrides(), input.modelProviderId, input.model);
+  const resolved = resolvePricing(input.modelProviderId, input.model);
+  const pricing: PricingResult = override
+    ? {
+        ...resolved,
+        price: override.price
+          ? {
+              input: override.price.input,
+              cached: override.price.cached ?? override.price.input,
+              cacheWrite: override.price.cacheWrite ?? override.price.input,
+              output: override.price.output,
+            }
+          : null,
+        status: "override",
+      }
+    : resolved;
   const uncached = count(input.uncachedInputTokens);
   const cached = count(input.cachedInputTokens);
   const writes = count(input.cacheWriteTokens);
   const output = count(input.outputTokens);
   const logged = finite(input.loggedCostUsd);
-  const positiveLogged = logged !== null && logged > 0 ? logged : null;
-  const loggedOnly = input.costMode === "logged-only";
-  const recordedOnly = loggedOnly || (input.costMode === "logged-or-estimate" && positiveLogged !== null);
+  const positiveLogged = override
+    ? null
+    : logged !== null && logged > 0
+      ? logged
+      : null;
+  const loggedOnly = override ? false : input.costMode === "logged-only";
+  const recordedOnly = override
+    ? false
+    : loggedOnly || (input.costMode === "logged-or-estimate" && positiveLogged !== null);
   const estimated = !recordedOnly && pricing.price
     ? ((uncached * pricing.price.input) + (cached * pricing.price.cached) + (writes * pricing.price.cacheWrite) + (output * pricing.price.output)) / 1_000_000
     : null;
-  const effectiveLogged = input.costMode === "logged-or-estimate"
-    ? positiveLogged
-    : loggedOnly && logged !== null ? Math.max(0, logged) : logged;
+  const effectiveLogged = override
+    ? null
+    : input.costMode === "logged-or-estimate"
+      ? positiveLogged
+      : loggedOnly && logged !== null ? Math.max(0, logged) : logged;
   const timestamp = isoTimestamp(input.timestamp) ?? input.timestamp;
   return {
     eventKey: input.eventKey,
@@ -151,7 +175,11 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
     project: text(input.project, "Unknown"),
     costUsd: Number((estimated ?? effectiveLogged ?? 0).toFixed(6)),
     loggedCostUsd: effectiveLogged === null ? null : Number(Math.max(0, effectiveLogged).toFixed(6)),
-    pricingStatus: estimated !== null ? pricing.status : effectiveLogged !== null ? "logged" : "unknown",
+    pricingStatus: override
+      ? pricing.price
+        ? "override"
+        : "unknown"
+      : estimated !== null ? pricing.status : effectiveLogged !== null ? "logged" : "unknown",
     cacheSavingsUsd: pricing.price ? Number(((cached * Math.max(0, pricing.price.input - pricing.price.cached)) / 1_000_000).toFixed(6)) : 0,
     processedTokens: uncached + cached + writes + output,
     cachedInputTokens: cached,

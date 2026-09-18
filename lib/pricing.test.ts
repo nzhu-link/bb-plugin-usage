@@ -126,3 +126,47 @@ describe("proxy provider fallback", () => {
     expect(priceFor("cliproxy", "swe-2-max")).toBeNull();
   });
 });
+
+describe("vendor-declared model ids", () => {
+  afterEach(() => resetPricingCatalog());
+
+  it("prices a vendor-prefixed id against the vendor it names", () => {
+    setPricingCatalog({
+      openai: catalogProvider({ "gpt-6-astra": { input: 10, output: 50 } }, "OpenAI"),
+      codex: catalogProvider({ "gpt-5.6-sol": { input: 1, output: 8 } }, "Codex"),
+    }, "test");
+    expect(resolvePricing("openai", "openai.gpt-6-astra")).toMatchObject({
+      modelProviderId: "openai",
+      status: "models-dev-alias",
+      price: { input: 10, output: 50 },
+    });
+    expect(resolvePricing("codex", "openai.gpt-6-astra")).toMatchObject({
+      modelProviderId: "openai",
+      status: "models-dev-alias",
+      price: { input: 10, output: 50 },
+    });
+  });
+
+  it("prefers the bedrock regional entry for region-prefixed ids", () => {
+    setPricingCatalog({
+      "amazon-bedrock": catalogProvider({ "us.openai.gpt-6-astra": { input: 11, output: 55 } }, "Amazon Bedrock"),
+      openai: catalogProvider({ "gpt-6-astra": { input: 10, output: 50 } }, "OpenAI"),
+    }, "test");
+    expect(resolvePricing("openai", "us.openai.gpt-6-astra")).toMatchObject({
+      modelProviderId: "amazon-bedrock",
+      price: { input: 11, output: 55 },
+    });
+  });
+
+  it("does not extend the vendor-declared path to bare names", () => {
+    setPricingCatalog({
+      anthropic: catalogProvider({ "claude-fable-5": { input: 10, output: 50 } }, "Anthropic"),
+      opencode: catalogProvider({ "glm-5.3": { input: 3, output: 6 } }, "OpenCode Zen"),
+    }, "test");
+    expect(resolvePricing("anthropic", "glm-5.3")).toMatchObject({
+      modelProviderId: "anthropic",
+      price: null,
+      status: "unknown",
+    });
+  });
+});

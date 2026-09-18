@@ -2,7 +2,7 @@ import { generatedAt, providers } from "@opencode-ai/models/snapshot";
 import type { ModelCost } from "@opencode-ai/models";
 
 export type Price = { input: number; cached: number; cacheWrite: number; output: number };
-export type PricingStatus = "models-dev-exact" | "models-dev-alias" | "logged" | "unknown";
+export type PricingStatus = "models-dev-exact" | "models-dev-alias" | "override" | "logged" | "unknown";
 export type PricingResult = {
   modelProviderId: string;
   modelProviderName: string;
@@ -147,6 +147,37 @@ function matchViaFirstParty(modelIds: string[]): PricingResult | null {
   return null;
 }
 
+// A model id can declare its own vendor: bedrock inference-profile ids such as
+// us.openai.gpt-6-astra, and gateway ids that keep the vendor prefix such as
+// openai.gpt-6-astra. The embedded vendor name is structural evidence — unlike
+// a bare name it cannot collide with an unrelated provider's model — so these
+// ids may price against the vendor section even when the row's provider
+// section exists but does not list the model.
+const regionPrefixPattern = /^(?:us|eu|global|apac)\./;
+
+function matchViaVendorDeclaredId(model: string): PricingResult | null {
+  const providers = activeProviders();
+  const normalized = model.trim().toLowerCase();
+  if (regionPrefixPattern.test(normalized)) {
+    const bedrock = providers["amazon-bedrock"];
+    const regional = matchWithinProvider("amazon-bedrock", bedrock, normalized);
+    if (regional) return { ...regional, status: "models-dev-alias" };
+  }
+  const withoutRegion = normalized.replace(regionPrefixPattern, "");
+  const dot = withoutRegion.indexOf(".");
+  if (dot <= 0) return null;
+  const vendorRaw = withoutRegion.slice(0, dot);
+  const rest = withoutRegion.slice(dot + 1);
+  if (!rest || !/^[a-z0-9][a-z0-9-]*$/.test(vendorRaw)) return null;
+  const vendorId = normalizeProviderId(vendorRaw);
+  const vendor = providers[vendorId];
+  if (!vendor) return null;
+  const match =
+    matchWithinProvider(vendorId, vendor, rest) ??
+    matchWithinProvider(vendorId, vendor, withoutRegion);
+  return match ? { ...match, status: "models-dev-alias" } : null;
+}
+
 function uniqueCatalogMatch(modelIds: string[]): PricingResult | null {
   for (const modelId of modelIds) {
     const matches = Object.entries(activeProviders()).flatMap(([candidateId, candidate]) => {
@@ -173,6 +204,13 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
     return { modelProviderId, modelProviderName: providerName(modelProviderId, provider) || builtinPrices[modelProviderId]!.name!, price: builtin, status: "models-dev-exact" };
   }
 
+  // Explicit providers must never inherit a different vendor's rates through
+  // bare-name matching, but a vendor-declared id (openai.gpt-6-astra,
+  // us.openai.gpt-6-astra) carries its own attribution and may price against
+  // the vendor it names.
+  const declared = matchViaVendorDeclaredId(model);
+  if (declared) return declared;
+
   // Explicit providers must never inherit a different vendor's rates.
   if (provider || builtinPrices[modelProviderId]) {
     return { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
@@ -183,9 +221,12 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
   // name variants, then a catalog-wide unique exact match.
   if (modelProviderId !== "unknown") {
     const modelIds = proxyModelIds(modelProviderId, model);
-    const inferred = matchViaFirstParty(modelIds) ?? uniqueCatalogMatch(modelIds);
+    const inferred = matchViaVendorDeclaredId(model) ?? matchViaFirstParty(modelIds) ?? uniqueCatalogMatch(modelIds);
     return inferred ?? { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
   }
+
+  const declaredUnknownProvider = matchViaVendorDeclaredId(model);
+  if (declaredUnknownProvider) return declaredUnknownProvider;
 
   const exactMatches = Object.entries(activeProviders()).flatMap(([candidateId, candidate]) => {
     const exact = normalizedModelIds(modelProviderId, model).map((modelId) => candidate.models[modelId]).find((item) => item?.cost);
