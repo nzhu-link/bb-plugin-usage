@@ -158,14 +158,16 @@ const regionPrefixPattern = /^(?:us|eu|global|apac)\./;
 function matchViaVendorDeclaredId(model: string): PricingResult | null {
   const providers = activeProviders();
   const normalized = model.trim().toLowerCase();
-  if (regionPrefixPattern.test(normalized)) {
-    const bedrock = providers["amazon-bedrock"];
-    const regional = matchWithinProvider("amazon-bedrock", bedrock, normalized);
-    if (regional) return { ...regional, status: "models-dev-alias" };
-  }
   const withoutRegion = normalized.replace(regionPrefixPattern, "");
   const dot = withoutRegion.indexOf(".");
+  // Only a dotted id carries a vendor; a bare name must keep falling through to
+  // the collision-averse paths.
   if (dot <= 0) return null;
+  // Bedrock lists these ids verbatim and resells above the vendor's direct
+  // rates, so its exact entry outranks the vendor section the id names.
+  const bedrockSection = providers["amazon-bedrock"];
+  const bedrock = bedrockSection ? matchWithinProvider("amazon-bedrock", bedrockSection, normalized) : null;
+  if (bedrock) return { ...bedrock, status: "models-dev-alias" };
   const vendorRaw = withoutRegion.slice(0, dot);
   const rest = withoutRegion.slice(dot + 1);
   if (!rest || !/^[a-z0-9][a-z0-9-]*$/.test(vendorRaw)) return null;

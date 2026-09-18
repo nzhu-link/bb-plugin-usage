@@ -147,6 +147,19 @@ describe("vendor-declared model ids", () => {
     });
   });
 
+  // Bedrock resells astra 10% above OpenAI's direct rates, so a row that names
+  // a bedrock id must not be priced from the vendor section.
+  it("prefers the bedrock entry over the vendor it names", () => {
+    setPricingCatalog({
+      "amazon-bedrock": catalogProvider({ "openai.gpt-6-astra": { input: 11, output: 55 } }, "Amazon Bedrock"),
+      openai: catalogProvider({ "gpt-6-astra": { input: 10, output: 50 } }, "OpenAI"),
+    }, "test");
+    expect(resolvePricing("codex", "openai.gpt-6-astra")).toMatchObject({
+      modelProviderId: "amazon-bedrock",
+      price: { input: 11, output: 55 },
+    });
+  });
+
   it("prefers the bedrock regional entry for region-prefixed ids", () => {
     setPricingCatalog({
       "amazon-bedrock": catalogProvider({ "us.openai.gpt-6-astra": { input: 11, output: 55 } }, "Amazon Bedrock"),
