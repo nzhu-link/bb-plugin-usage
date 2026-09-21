@@ -9,6 +9,7 @@ import {
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
 import { openCodeGoUsageCommand, extractOpenCodeGoFingerprint, parseOpenCodeGoUsage } from "./lib/opencode-go";
+import { cursorUsageCommand, extractCursorJson, parseCursorUsageEvents } from "./lib/cursor-usage";
 import {
   compressedHostJsonCollectorScript,
   extractHostJsonScan,
@@ -80,6 +81,7 @@ type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSes
 const AGENTS = [
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
+  { id: "cursor", name: "Cursor" },
   { id: "dsh", name: "DeepSeek Harness" },
   { id: "devin", name: "Devin" },
   { id: "fx", name: "FX" },
@@ -162,6 +164,8 @@ const DEVIN_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_ABSENCE_ERRORS = new Set(["no-opencode-go-credential", "no-opencode-go-plan"]);
+const CURSOR_SYNC_TIMEOUT_MS = 120_000;
+const CURSOR_HISTORY_DAYS = 7;
 const DASHBOARD_HISTORY_DAYS = 90;
 const OPENCODE_HISTORY_DAYS = DASHBOARD_HISTORY_DAYS;
 const HISTORY_DAYS = 365;
@@ -608,6 +612,57 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+// Server-side collector: cursor-agent reports no usage over ACP and its local
+// chat stores carry no token counts, so usage is pulled from the Cursor
+// dashboard API with the machine's own CLI login (read-only calls). Rows land
+// in usage_events with provider_id "cursor" and the vendor's charged cents as
+// the logged cost, exactly like the fx logged-only path.
+export async function syncCursorUsage(
+  bb: BbPluginApi,
+  db: Database,
+  machine: Machine,
+  signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  const agentId: AgentId = "cursor";
+  const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const output = await executeHostCommand(bb, machine, cursorUsageCommand(CURSOR_HISTORY_DAYS), signal, {
+      title: "Usage: Cursor server sync",
+      timeoutMs: CURSOR_SYNC_TIMEOUT_MS,
+    });
+    const payload = extractCursorJson(output) as { teamId: string; events: unknown[] };
+    const aggregateJson = JSON.stringify(payload);
+    const records = parseCursorUsageEvents(payload, {
+      machineId: machine.id,
+      machineName: machine.name,
+    });
+    const sourceId = opaqueId(machine.id, agentId, "cursor-server-v1", payload.teamId);
+    upsertSourceEvents(db, {
+      id: sourceId,
+      rootReference: opaqueId("cursor-dashboard-api", payload.teamId),
+      sha256: createHash("sha256").update(aggregateJson).digest("hex"),
+      generation,
+    }, machine, agentId, records);
+    reconcileSources(db, machine.id, agentId, generation);
+
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const status = recordCount > 0 ? "ready" : "no-data";
+    upsertState(db, machine.id, agentId, status, recordCount, null, true);
+    bb.log.info(`${machine.name}/${agentId}: ${recordCount} records from Cursor dashboard API (${status})`);
+  } catch (error) {
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const raw = errorMessage(error);
+    const message = raw === "no-cursor-credential"
+      ? "Cursor login not found on this machine."
+      : raw === "cursor-login-expired"
+        ? "Cursor login expired. Re-run cursor-agent login on the machine."
+        : `Cursor sync failed: ${raw}`;
+    upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+    bb.log.warn(`${machine.name}/${agentId}: ${message}`);
+  }
+}
+
 type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number; home?: string };
 
 function heldHostCommand(command: string) {
@@ -1043,6 +1098,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncDevin(bb, db, machine, home, timeoutSignal(DEVIN_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
           syncGrokLimits(bb, db, machine, timeoutSignal(60_000, serviceSignal)),
+          syncCursorUsage(bb, db, machine, timeoutSignal(CURSOR_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }
