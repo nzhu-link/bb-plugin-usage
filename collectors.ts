@@ -200,7 +200,7 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
 export function repriceUsageRecord(record: UsageRecord): UsageRecord {
   return usageRecord({
     ...record,
-    costMode: record.agentId === "fx" ? "logged-only"
+    costMode: record.agentId === "fx" || record.agentId === "cursor" ? "logged-only"
       : ["opencode", "pi", "prime", "thaura"].includes(record.agentId) ? "logged-or-estimate"
       : "estimate-or-logged",
   }, record);
