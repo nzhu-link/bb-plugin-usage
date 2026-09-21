@@ -9,7 +9,7 @@ import {
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
 import { openCodeGoUsageCommand, extractOpenCodeGoFingerprint, parseOpenCodeGoUsage } from "./lib/opencode-go";
-import { cursorUsageCommand, extractCursorJson, parseCursorUsageEvents } from "./lib/cursor-usage";
+import { CURSOR_HISTORY_DAYS, cursorUsageCommand, extractCursorJson, parseCursorUsageEvents } from "./lib/cursor-usage";
 import {
   compressedHostJsonCollectorScript,
   extractHostJsonScan,
@@ -165,7 +165,6 @@ const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_ABSENCE_ERRORS = new Set(["no-opencode-go-credential", "no-opencode-go-plan"]);
 const CURSOR_SYNC_TIMEOUT_MS = 120_000;
-const CURSOR_HISTORY_DAYS = 7;
 const DASHBOARD_HISTORY_DAYS = 90;
 const OPENCODE_HISTORY_DAYS = DASHBOARD_HISTORY_DAYS;
 const HISTORY_DAYS = 365;

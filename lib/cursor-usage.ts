@@ -15,7 +15,7 @@ import type { UsageRecord } from "../collectors";
 
 export const CURSOR_API_BASE_URL = "https://api2.cursor.sh";
 const CURSOR_DASHBOARD_SERVICE = "aiserver.v1.DashboardService";
-const CURSOR_HISTORY_DAYS = 7;
+export const CURSOR_HISTORY_DAYS = 30;
 const CURSOR_PAGE_SIZE = 100;
 const CURSOR_MAX_PAGES = 200;
 
@@ -49,62 +49,54 @@ function text(value: unknown, fallback: string): string {
   return typeof value === "string" && value.trim().length > 0 ? value : fallback;
 }
 
-function isoFromMs(value: unknown): string | null {
-  const ms = typeof value === "number" && Number.isFinite(value)
-    ? value
-    : typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))
-      ? Number(value)
-      : null;
-  if (ms === null) return null;
-  const date = new Date(ms);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
-function localDayOf(iso: string): string {
-  const parsed = new Date(iso);
-  return Number.isNaN(parsed.getTime())
-    ? iso.slice(0, 10)
-    : `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
-}
-
 function slug(value: string): string {
   return encodeURIComponent(value).slice(0, 120);
 }
 
-// Deterministic key: the API exposes no per-event id, so the key is the full
-// tuple. Two genuinely identical agent calls in the same millisecond would
-// share a key; that collision is preferred over page-index keys, which shift
-// on every resync as new events arrive.
-function eventKey(teamId: string, timestampMs: string, model: string, conversation: string, parts: Array<string | number>): string {
-  return ["cursor", slug(teamId), slug(timestampMs), slug(model), slug(conversation), ...parts.map((part) => slug(String(part)))].join(":");
-}
+// One row per team per day per model. Per-event rows were tried first and
+// rejected: ~800 team-wide events/day serialize past the host-command output
+// cap (MEASURED 2026-09-21: 7d of raw events exceeded the 900 KB limit), and
+// thousands of team-attributed rows would swamp a dashboard where every other
+// provider contributes per-session rows. Daily model grain answers the actual
+// question (what are we spending on Cursor) and backfills 30d in one small
+// payload. Event keys are deterministic, so resyncs update in place.
+export type CursorAggregate = {
+  day: string;
+  model: string;
+  uncachedInputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  eventCount: number;
+};
 
 export function parseCursorUsageEvents(payload: unknown, context: CursorParseContext): UsageRecord[] {
   const data = object(payload);
-  if (!data || typeof data.teamId !== "string" || !data.teamId || !Array.isArray(data.events)) {
+  if (!data || typeof data.teamId !== "string" || !data.teamId || !Array.isArray(data.aggregates)) {
     throw new Error("Cursor usage response had an unexpected shape.");
   }
+  const teamId = data.teamId;
   const records: UsageRecord[] = [];
-  data.events.forEach((entry, index) => {
-    const event = object(entry);
-    if (!event) throw new Error(`Cursor usage event at index ${index} had an unexpected shape.`);
-    const timestamp = isoFromMs(event.timestamp);
-    if (!timestamp) throw new Error(`Cursor usage event at index ${index} had an invalid timestamp.`);
-    const model = text(event.model, "unknown");
-    const tokenUsage = object(event.tokenUsage) ?? {};
-    const uncached = count(tokenUsage.inputTokens);
-    const cached = count(tokenUsage.cacheReadTokens);
-    const writes = count(tokenUsage.cacheWriteTokens);
-    const output = count(tokenUsage.outputTokens);
-    // chargedCents is the authoritative vendor figure (token cost +
-    // cursorTokenFee). requestsCosts is a request count, not dollars.
-    const logged = money(event.chargedCents);
+  data.aggregates.forEach((entry, index) => {
+    const agg = object(entry);
+    if (!agg) throw new Error(`Cursor usage aggregate at index ${index} had an unexpected shape.`);
+    const day = typeof agg.day === "string" && /^\d{4}-\d{2}-\d{2}$/.test(agg.day) ? agg.day : null;
+    if (!day) throw new Error(`Cursor usage aggregate at index ${index} had an invalid day.`);
+    const model = text(agg.model, "unknown");
+    const uncached = count(agg.uncachedInputTokens);
+    const cached = count(agg.cachedInputTokens);
+    const writes = count(agg.cacheWriteTokens);
+    const output = count(agg.outputTokens);
+    // chargedCents summed server-side is the authoritative vendor figure
+    // (token cost + cursorTokenFee). requestsCosts is a request count, not
+    // dollars, and never enters the money path.
+    const logged = money(agg.chargedCents);
     const costUsd = logged !== null ? Number(Math.max(0, logged).toFixed(6)) : 0;
-    const conversation = text(event.conversationId, "-");
     records.push({
-      eventKey: eventKey(data.teamId as string, String(event.timestamp), model, conversation, [uncached, cached, writes, output, costUsd, index]),
-      timestamp,
-      day: localDayOf(timestamp),
+      eventKey: ["cursor", slug(teamId), slug(day), slug(model)].join(":"),
+      timestamp: `${day}T12:00:00.000Z`,
+      day,
       agentId: "cursor",
       agentName: "Cursor",
       modelProviderId: "cursor",
@@ -181,8 +173,28 @@ const path = require('node:path');
     if (rows.length < ${CURSOR_PAGE_SIZE}) break;
     if (typeof res.totalUsageEventsCount === 'number' && events.length >= res.totalUsageEventsCount) break;
   }
+  // Aggregate to one row per day per model HERE so the payload stays small:
+  // thousands of raw team-wide events exceed the host-command output cap.
+  const buckets = new Map();
+  for (const e of events) {
+    const ms = Number(e && e.timestamp);
+    if (!Number.isFinite(ms)) continue;
+    const day = new Date(ms).toISOString().slice(0, 10);
+    const model = typeof e.model === 'string' && e.model ? e.model : 'unknown';
+    const tu = e.tokenUsage || {};
+    const num = (v) => typeof v === 'number' && Number.isFinite(v) ? v : (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)) ? Number(v) : 0);
+    const key = day + '\\0' + model;
+    let b = buckets.get(key);
+    if (!b) { b = { day, model, uncachedInputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, chargedCents: 0, eventCount: 0 }; buckets.set(key, b); }
+    b.uncachedInputTokens += Math.max(0, Math.round(num(tu.inputTokens)));
+    b.cachedInputTokens += Math.max(0, Math.round(num(tu.cacheReadTokens)));
+    b.cacheWriteTokens += Math.max(0, Math.round(num(tu.cacheWriteTokens)));
+    b.outputTokens += Math.max(0, Math.round(num(tu.outputTokens)));
+    b.chargedCents += num(e.chargedCents);
+    b.eventCount += 1;
+  }
   console.log('__BB_USAGE_BEGIN__');
-  console.log(JSON.stringify({ teamId, fetchedAt: new Date().toISOString(), events }));
+  console.log(JSON.stringify({ teamId, fetchedAt: new Date().toISOString(), aggregates: [...buckets.values()] }));
   console.log('__BB_USAGE_END__:0');
 })().catch(e => { console.log('__BB_USAGE_ERROR__:' + e.message); process.exitCode = 1; });`;
   return `set +x; if ! command -v node >/dev/null 2>&1; then printf '%s\\n' '__BB_USAGE_ERROR__:Node.js is required to collect Cursor usage.'; exit 127; fi; node -e '${script.replace(/'/g, `'\\''`)}'`;
