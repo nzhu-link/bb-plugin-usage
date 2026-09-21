@@ -71,6 +71,46 @@ export type CursorAggregate = {
   eventCount: number;
 };
 
+export type CursorConversation = {
+  day: string;
+  conversationId: string;
+  model: string;
+  uncachedInputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  eventCount: number;
+};
+
+export function parseCursorConversations(payload: unknown): CursorConversation[] {
+  const data = object(payload);
+  if (!data || typeof data.teamId !== "string" || !data.teamId || !Array.isArray(data.conversations)) {
+    throw new Error("Cursor usage response had an unexpected shape.");
+  }
+  const out: CursorConversation[] = [];
+  data.conversations.forEach((entry, index) => {
+    const row = object(entry);
+    if (!row) throw new Error(`Cursor conversation row at index ${index} had an unexpected shape.`);
+    const day = typeof row.day === "string" && /^\d{4}-\d{2}-\d{2}$/.test(row.day) ? row.day : null;
+    const conversationId = typeof row.conversationId === "string" && row.conversationId ? row.conversationId : null;
+    if (!day || !conversationId) throw new Error(`Cursor conversation row at index ${index} had an invalid day or conversation.`);
+    const logged = money(row.chargedCents);
+    out.push({
+      day,
+      conversationId,
+      model: text(row.model, "unknown"),
+      uncachedInputTokens: count(row.uncachedInputTokens),
+      cachedInputTokens: count(row.cachedInputTokens),
+      cacheWriteTokens: count(row.cacheWriteTokens),
+      outputTokens: count(row.outputTokens),
+      costUsd: logged !== null ? Number(Math.max(0, logged).toFixed(6)) : 0,
+      eventCount: count(row.eventCount),
+    });
+  });
+  return out;
+}
+
 export function parseCursorUsageEvents(payload: unknown, context: CursorParseContext): UsageRecord[] {
   const data = object(payload);
   if (!data || typeof data.teamId !== "string" || !data.teamId || !Array.isArray(data.aggregates)) {
@@ -193,8 +233,31 @@ const path = require('node:path');
     b.chargedCents += num(e.chargedCents);
     b.eventCount += 1;
   }
+  // Second grain: per-conversation cost, so a live thread header can look up
+  // ITS session's spend. conversationId is the cursor session id bb stores as
+  // provider_thread_id (MEASURED 2026-09-21: 76/114 billed conversations join).
+  const convBuckets = new Map();
+  for (const e of events) {
+    const ms = Number(e && e.timestamp);
+    if (!Number.isFinite(ms)) continue;
+    const conv = typeof e.conversationId === 'string' && e.conversationId ? e.conversationId : null;
+    if (!conv) continue;
+    const day = new Date(ms).toISOString().slice(0, 10);
+    const model = typeof e.model === 'string' && e.model ? e.model : 'unknown';
+    const tu = e.tokenUsage || {};
+    const num = (v) => typeof v === 'number' && Number.isFinite(v) ? v : (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)) ? Number(v) : 0);
+    const key = day + '\\0' + conv;
+    let b = convBuckets.get(key);
+    if (!b) { b = { day, conversationId: conv, model, uncachedInputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, chargedCents: 0, eventCount: 0 }; convBuckets.set(key, b); }
+    b.uncachedInputTokens += Math.max(0, Math.round(num(tu.inputTokens)));
+    b.cachedInputTokens += Math.max(0, Math.round(num(tu.cacheReadTokens)));
+    b.cacheWriteTokens += Math.max(0, Math.round(num(tu.cacheWriteTokens)));
+    b.outputTokens += Math.max(0, Math.round(num(tu.outputTokens)));
+    b.chargedCents += num(e.chargedCents);
+    b.eventCount += 1;
+  }
   console.log('__BB_USAGE_BEGIN__');
-  console.log(JSON.stringify({ teamId, fetchedAt: new Date().toISOString(), aggregates: [...buckets.values()] }));
+  console.log(JSON.stringify({ teamId, fetchedAt: new Date().toISOString(), aggregates: [...buckets.values()], conversations: [...convBuckets.values()] }));
   console.log('__BB_USAGE_END__:0');
 })().catch(e => { console.log('__BB_USAGE_ERROR__:' + e.message); process.exitCode = 1; });`;
   return `set +x; if ! command -v node >/dev/null 2>&1; then printf '%s\\n' '__BB_USAGE_ERROR__:Node.js is required to collect Cursor usage.'; exit 127; fi; node -e '${script.replace(/'/g, `'\\''`)}'`;

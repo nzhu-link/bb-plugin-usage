@@ -50,8 +50,7 @@ describe("parseCursorUsageEvents", () => {
   });
 });
 
-describe("extractCursorJson", () => {
-  it("round-trips the collector envelope and surfaces error markers", () => {
+describe("extractCursorJson", () => {  it("round-trips the collector envelope and surfaces error markers", () => {
     const payload = { teamId: "t", aggregates: [] };
     const parsed = extractCursorJson(`noise\n__BB_USAGE_BEGIN__\n${JSON.stringify(payload)}\n__BB_USAGE_END__:0\n`);
     expect(parsed).toEqual(payload);
@@ -67,5 +66,19 @@ describe("cursorUsageCommand", () => {
     expect(command).toContain("GetFilteredUsageEvents");
     expect(command).toContain("GetTeams");
     expect(command).toContain("CURSOR_API_BASE_URL");
+  });
+});
+
+describe("parseCursorConversations", () => {
+  it("maps per-conversation spend", async () => {
+    const { parseCursorConversations } = await import("./cursor-usage");
+    const [row] = parseCursorConversations({ teamId: "87654321", conversations: [{
+      day: "2026-09-21", conversationId: "30c572dc-96b3-4056-bfd8-bfd9425c4f23",
+      model: "muse-spark-1.3-high", uncachedInputTokens: 2405, cachedInputTokens: 804563,
+      cacheWriteTokens: 0, outputTokens: 875, chargedCents: 32.937, eventCount: 3,
+    }] });
+    expect(row.conversationId).toBe("30c572dc-96b3-4056-bfd8-bfd9425c4f23");
+    expect(row.costUsd).toBeCloseTo(0.32937, 6);
+    expect(row.eventCount).toBe(3);
   });
 });

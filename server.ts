@@ -9,7 +9,7 @@ import {
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
 import { openCodeGoUsageCommand, extractOpenCodeGoFingerprint, parseOpenCodeGoUsage } from "./lib/opencode-go";
-import { CURSOR_HISTORY_DAYS, cursorUsageCommand, extractCursorJson, parseCursorUsageEvents } from "./lib/cursor-usage";
+import { CURSOR_HISTORY_DAYS, cursorUsageCommand, extractCursorJson, parseCursorConversations, parseCursorUsageEvents } from "./lib/cursor-usage";
 import {
   compressedHostJsonCollectorScript,
   extractHostJsonScan,
@@ -644,6 +644,41 @@ export async function syncCursorUsage(
       generation,
     }, machine, agentId, records);
     reconcileSources(db, machine.id, agentId, generation);
+
+    // Per-conversation grain for live thread headers: conversationId is the
+    // cursor session id bb stores as provider_thread_id, so a pane badge can
+    // look up exactly its own thread's spend instead of showing unknown.
+    const conversations = parseCursorConversations(payload);
+    db.prepare(`CREATE TABLE IF NOT EXISTS cursor_conversation_cost (
+      team_id TEXT NOT NULL, day TEXT NOT NULL, conversation_id TEXT NOT NULL,
+      model TEXT NOT NULL DEFAULT 'unknown',
+      uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0, event_count INTEGER NOT NULL DEFAULT 0,
+      fetched_at TEXT NOT NULL,
+      PRIMARY KEY (team_id, day, conversation_id)
+    )`).run();
+    const upsertConversation = db.prepare(`INSERT INTO cursor_conversation_cost (
+        team_id, day, conversation_id, model, uncached_input_tokens, cached_input_tokens,
+        cache_write_tokens, output_tokens, cost_usd, event_count, fetched_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(team_id, day, conversation_id) DO UPDATE SET model=excluded.model,
+      uncached_input_tokens=excluded.uncached_input_tokens, cached_input_tokens=excluded.cached_input_tokens,
+      cache_write_tokens=excluded.cache_write_tokens, output_tokens=excluded.output_tokens,
+      cost_usd=excluded.cost_usd, event_count=excluded.event_count, fetched_at=excluded.fetched_at`);
+    const conversationTx = db.transaction((rows: typeof conversations) => {
+      const now = new Date().toISOString();
+      for (const row of rows) {
+        upsertConversation.run(payload.teamId, row.day, row.conversationId, row.model,
+          row.uncachedInputTokens, row.cachedInputTokens, row.cacheWriteTokens,
+          row.outputTokens, row.costUsd, row.eventCount, now);
+      }
+      const cutoff = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+      db.prepare("DELETE FROM cursor_conversation_cost WHERE day < ?").run(cutoff);
+    });
+    conversationTx(conversations);
 
     const recordCount = countForMachine(db, machine.id, agentId);
     const status = recordCount > 0 ? "ready" : "no-data";
