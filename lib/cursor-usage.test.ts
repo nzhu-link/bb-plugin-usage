@@ -26,7 +26,7 @@ const context = { machineId: "m1", machineName: "box" };
 
 describe("parseCursorUsageEvents", () => {
   it("maps tokens and the authoritative charged figure", () => {
-    const [record] = parseCursorUsageEvents({ teamId: "31409137", fetchedAt: "2026-09-21T20:30:00.000Z", events: [event()] }, context);
+    const [record] = parseCursorUsageEvents({ teamId: "87654321", fetchedAt: "2026-09-21T20:30:00.000Z", events: [event()] }, context);
     expect(record.agentId).toBe("cursor");
     expect(record.model).toBe("muse-spark-1.3-high");
     expect(record.uncachedInputTokens).toBe(85123);
@@ -42,10 +42,10 @@ describe("parseCursorUsageEvents", () => {
   });
 
   it("keys events deterministically without page indexes shifting history", () => {
-    const payload = { teamId: "31409137", events: [event(), event()] };
+    const payload = { teamId: "87654321", events: [event(), event()] };
     const [first, second] = parseCursorUsageEvents(payload, context);
     expect(first.eventKey).not.toBe(second.eventKey);
-    expect(first.eventKey.startsWith("cursor:31409137:")).toBe(true);
+    expect(first.eventKey.startsWith("cursor:87654321:")).toBe(true);
     const again = parseCursorUsageEvents(payload, context);
     expect(again[0].eventKey).toBe(first.eventKey);
     expect(again[1].eventKey).toBe(second.eventKey);
